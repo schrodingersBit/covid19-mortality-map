@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Heatmaps</title>
+    <style>
+      /* to have the map be displayed as large as possible */
+      html, body, #map-canvas {
+        height: 100%;
+        margin: 0px;
+        padding: 0px
+      }
+    </style>
+    <script src="https://maps.googleapis.com/maps/api/js?key=AIzaSyDOAZgSG75LZyHAcin0jxLkq5ajsRUszXo&libraries=visualization" type="text/javascript"></script>
+    <script>
+var map, pointarray, heatmap;
+ 
+var grad = [
+"rgba(102, 0,255,0)",
+"rgba(200, 0,255, 1)",
+"rgba(210, 0,255, 1)",
+"rgba(223, 0,235, 1)",
+"rgba(238, 0,215, 1)",
+"rgba(244, 0,227, 1)",
+"rgba(249, 0,198, 1)",
+"rgba(255, 0,170, 1)",
+"rgba(255, 0,113, 1)",
+"rgba(255, 0,57, 1)",
+"rgba(255, 0, 0, 1)"];
+
+var sip = [
+{stateName: "New York", date: "3/20/20"},
+{stateName: "Louisiana", date: "3/22/20"},
+];
+
+var curDate = 0;
+var pointArray;
+
+var animationTickID = -1;
+var displayControl;
+var locInfoControl;
+var inAnimation = false;
+var markers = [];
+
+function parseCsv(str, opts = {}) {
+  var arr = [];
+  var quote = false;  // true means we're inside a quoted field
+  var col, c;
+
+  // iterate over each character, keep track of current row and column (of the returned array)
+  for (var row = col = c = 0; c < str.length; c++) {
+    var cc = str[c], nc = str[c+1];        // current character, next character
+    arr[row] = arr[row] || [];             // create a new row if necessary
+    arr[row][col] = arr[row][col] || '';   // create a new column (start with empty string) if necessary
+
+    // If the current character is a quotation mark, and we're inside a
+    // quoted field, and the next character is also a quotation mark,
+    // add a quotation mark to the current column and skip the next character
+    if (cc == '"' && quote && nc == '"') { arr[row][col] += cc; ++c; continue; }
+
+    // If it's just one quotation mark, begin/end quoted field
+    if (cc == '"') { quote = !quote; continue; }
+
+    // If it's a comma and we're not in a quoted field, move on to the next column
+    if (cc == ',' && !quote) { ++col; continue; }
+
+    // If it's a newline (CRLF) and we're not in a quoted field, skip the next character
+    // and move on to the next row and move to column 0 of that new row
+    if (cc == '\r' && nc == '\n' && !quote) { ++row; col = 0; ++c; continue; }
+
+    // If it's a newline (LF or CR) and we're not in a quoted field,
+    // move on to the next row and move to column 0 of that new row
+    if (cc == '\n' && !quote) { ++row; col = 0; continue; }
+    if (cc == '\r' && !quote) { ++row; col = 0; continue; }
+
+    // Otherwise, append the current character to the current column
+    arr[row][col] += cc;
+  }
+
+  if (opts.headers) {
+    let header = arr[0]
+    let rest = arr.slice(1)
+    return rest.map(r => {
+      return r.reduce((acc, v, i) => {
+        let key = header[i]
+        acc[key] = v
+        return acc
+      }, {})
+    })
+  }
+  else {
+    return arr;
+  }
+}
+
+var rawData;
+var dataReady = false;
+var dateCache = {};
+var numDates = 0;
+
+function getDataForDate(date) {  
+  var ret = [];
+  if (dataReady) {
+    if (date in dateCache) {
+      ret = dateCache[date];
+    }
+    else {
+      rawData.forEach(function(item, index) {
+        var wt = parseInt(item[date]);
+        if (wt > 0) {
+          var lat = parseFloat(item.Lat);
+          var lon = parseFloat(item.Long_);
+          var o = { location: new google.maps.LatLng(lat,lon),
+                    weight: wt,
+                    cityName: item["Combined_Key"]};
+          ret.push(o);
+        }
+      });
+      dateCache[date] = ret;
+    }
+  }
+  return ret;
+}
+
+function getAllData() {
+  var httpRequest = new XMLHttpRequest();
+  var url = "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_deaths_US.csv";
+  httpRequest.open("GET", url);
+  httpRequest.send();
+  httpRequest.onreadystatechange = function() {
+    console.log(this.readyState.toString() + ":" + this.status.toString());
+    if ((this.readyState == 4) && (this.status == 200)) {
+      var res = httpRequest.responseText;
+      rawData = parseCsv(res,{headers: true});
+
+      // first pick out the date range from the data
+      dates = [];
+      var firstRow = rawData[0];
+      Object.keys(firstRow).forEach(function(col,index) {
+        if (col.includes("/") && (col.substring(0,1) != "1") && (col.substring(0,1) != "2")) {
+          dates.push(col);
+        }
+      });
+      numDates = dates.length - 1;
+
+      // first normalize death values to daily vs cummulative
+      var prevDeaths = 0;
+      rawData.forEach(function(item, index) {
+        dates.forEach(function(date, index) {
+          var saveDeaths = item[date];
+          item[date] = item[date] - prevDeaths;
+          prevDeaths = saveDeaths;
+        });
+      });
+      dataReady = true;
+      updateMap();
+    }
+  }
+}
+
+function updateMap() {
+  heatmap.setMap(null);
+  pointArray = new google.maps.MVCArray(getDataForDate(dates[curDate]));
+  displayControl.innerHTML = dates[curDate];
+
+  // clear any existing markers
+  for (let i = 0;i < markers.length; i++) {
+    markers[i].setMap(null);
+  }
+  markers = [];
+
+  // now set up the new ones
+  var dailyData = getDataForDate(dates[curDate]);
+  dailyData.forEach(function(item, index) {
+    var marker = new google.maps.Marker({
+      position: item.location,
+      opacity: 0,
+      map: this.map,
+      optimized: false,
+      zIndex: item.weight
+    });
+    markers.push(marker);
+
+    function createString(item) {
+      let graphString = '<table>';
+      for (let i = -7;i < 8;i++) {
+        if ((curDate + i >= 0) && (curDate + i <= numDates)) {
+          graphString += '<tr>';
+          let obj = getDataForDate(dates[curDate + i]).find(o => o.cityName == item.cityName);
+          let weight = (obj == null) ? 0 : obj.weight;
+          graphString += '<td>' + dates[curDate + i] + '</td><td>' + weight.toString() + '</td><td>';
+          if (i == 0) {
+            graphString += '<font color="black">';
+          }
+          else {
+            graphString += '<font color="grey">';
+          }
+          for (var t = 0;t < weight / 10;t++) {
+            graphString += '&#x2588;';
+          }
+          graphString += '</font></td>';
+          let sipObj = sip.find(o => item.cityName.search(o.stateName + ', US') != -1 && o.date == dates[curDate + i]);
+          if (sipObj != null) {
+            graphString += '<td><font color="blue">&lArr;Shelter In Place</font></td>';
+          }
+          graphString += '</tr>';
+        }
+      }
+      graphString += '</table>';
+      return '<center><b>15 Day Sliding Window</b><br><br>' + item.cityName + ':' + item.weight.toString() + '<br><br></center>' + graphString;
+    }
+    var infoWindow = new google.maps.InfoWindow({
+      content: createString(item)
+    });
+    marker.addListener('mouseover', function() {
+      infoWindow.open(map,marker);
+    });
+    marker.addListener('mouseout', function() {
+      infoWindow.close();
+    });
+  });
+  heatmap = new google.maps.visualization.HeatmapLayer({
+    data: pointArray,
+    radius: 25,
+    dissipating: true,
+    maxIntensity: 50,
+    gradient: grad
+  });
+  heatmap.setMap(map);
+}
+
+function createControl(controlDiv, map, dir, label, altText) {
+  // Set CSS for the control border.
+  var controlUI = document.createElement('div');
+  controlUI.style.backgroundColor = '#fff';
+  controlUI.style.border = '1px solid #ccc';
+  controlUI.style.borderRadius = '2px';
+  controlUI.style.boxShadow = '0 2px 6px rgba(0,0,0,.3)';
+  controlUI.style.cursor = 'pointer';
+  controlUI.style.marginTop = '10px';
+  controlUI.style.marginBottom = '22px';
+  controlUI.style.marginRight = '2px';
+  controlUI.style.textAlign = 'center';
+  controlUI.style.display = 'inline-block';
+  controlUI.title = altText;
+  controlDiv.appendChild(controlUI);
+
+  // Set CSS for the control interior.
+  var controlText = document.createElement('div');
+  controlText.style.color = 'rgb(25,25,25)';
+  controlText.style.fontFamily = 'Roboto,Arial,sans-serif';
+  controlText.style.fontSize = '16px';
+  controlText.style.lineHeight = '35px';
+  controlText.style.paddingLeft = '5px';
+  controlText.style.paddingRight = '5px';
+  controlText.innerHTML = label;
+  controlText.alt = altText;
+  controlUI.appendChild(controlText);
+
+  // Setup the click event listeners: simply set the map to Chicago
+  if (dir == 0) {
+    // squirrel the date display for other uses
+    displayControl = controlText;
+    controlUI.addEventListener('click', function() {
+      if (inAnimation) {
+        inAnimation = false;
+        clearInterval(animationTickID);
+      }
+      else {
+        inAnimation = true;
+        animationTickID = setInterval(function() {
+          if (curDate == numDates) {
+            inAnimation = false;
+            clearInterval(animationTickID);            
+          }
+          else {
+            curDate += 1;
+          }
+          updateMap();
+        },300);
+      } // else
+    });
+    return;
+  }
+
+  controlUI.addEventListener('click', function() {
+    switch (dir) {
+      case   1 :
+      case   7 : curDate = (curDate + dir > numDates) ? 0 : curDate + dir; break;
+      case  -1 :
+      case  -7 : curDate = (curDate + dir < 0) ? numDates : curDate + dir; break;
+      case -99 : curDate = 0; break;
+      case  99 : curDate = numDates; break;
+    }
+    updateMap();
+  });
+}
+
+var heatmap;
+
+function initialize() {
+  // the map's options
+  var mapOptions = {
+    zoom: 5,
+    center: new google.maps.LatLng(39.8097343, -98.5556199) //,
+  };
+ 
+  // the map and where to place it
+  map = new google.maps.Map(document.getElementById('map-canvas'), mapOptions);
+  heatmap = new google.maps.visualization.HeatmapLayer({
+    data: [] ,
+    radius: 10
+  });
+  heatmap.setMap(map);
+
+  // create controls
+  var centerControlDiv = document.createElement('div');
+  var centerControlLess = new createControl(centerControlDiv, map, -99,"|<","Goto First Date");
+  var centerControlLess = new createControl(centerControlDiv, map, -7,"<<","Go Back One Week");
+  var centerControlLess = new createControl(centerControlDiv, map, -1,"<","Go Back One Day");
+  var centerControlDate = new createControl(centerControlDiv, map,  0,"Date","Animate");
+  var centerControlMore = new createControl(centerControlDiv, map,  1,">","Go Forward One Day");
+  var centerControlLess = new createControl(centerControlDiv, map,  7,">>","Go Forward One Week");
+  var centerControlLess = new createControl(centerControlDiv, map, 99,">|","Goto Last Date");
+
+  centerControlDiv.index = 1;
+  map.controls[google.maps.ControlPosition.TOP_CENTER].push(centerControlDiv);
+
+  getAllData();
+}
+ 
+// as soon as the document is ready the map is initialized
+google.maps.event.addDomListener(window, 'load', initialize);
+
+    </script>
+  </head>
+ 
+  <body>
+    <!-- this is where the map finally is drawn onto -->
+    <div id="map-canvas"></div>
+  </body>
+</html>
