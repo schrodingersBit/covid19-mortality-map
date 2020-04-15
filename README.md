@@ -4,3 +4,4 @@ Example GoogleMaps app that displays Covid-19 deaths per day (i.e. not cummunlat
 
 The data is sourced from the Johns Hopkins Covid-19 public dataset.
 
+Try it here: https://schrodingersbit.github.io/covid19-mortality-map/
